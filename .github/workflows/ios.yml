@@ -1,0 +1,386 @@
+# iOS derlemesi (derleme yansısı).
+#
+# Bu depo bir derleme yansısıdır: her dalında tek bir commit bulunur, geçmiş tutulmaz.
+#   main          : yalnız bu iş akışı ve README
+#   oyun/<kimlik> : o an derlenen oyunun anlık görüntüsü (derleme bitince silinir)
+#
+# Yalnız elle başlatılır (workflow_dispatch). Herkese açık depoda bu olayı yalnız depoya YAZMA yetkisi olan hesaplar
+# tetikleyebilir. pull_request tetikleyicisi bilerek yoktur: çatallardan gelen istekler bu iş akışını çalıştıramaz,
+# gizli değerlere erişemez.
+#
+#   hedef = denetim     : imzasız derleme; Apple bilgisi gerekmez. Çıktı yalnız kısa bir metin özetidir.
+#   hedef = testflight  : imzalanır ve doğrudan TestFlight'a yüklenir.
+#   hedef = magaza      : mağaza sürümü (yalnız bunu destekleyen oyunda); ek kapılardan geçer.
+#
+# Hiçbir hedefte uygulama paketi (IPA) artefakt olarak yüklenmez.
+# Derlenecek içerik dalın kökündeki yansi.cfg dosyasında tanımlıdır (OYUN, PROJE, KIP, CIKTI, REKLAM).
+#
+# Gizli değerler ("appstore" ortamında): ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8; mağaza + reklam için REKLAM_IOS_*.
+# Değişkenler (depo): IOS_TEAM_ID, IOS_BUNDLE_ID, IOS_<OYUN>_BUNDLE_ID, isteğe bağlı *_SUNUCU_ADRESI.
+name: iOS
+run-name: iOS ${{ inputs.hedef }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      hedef:
+        description: "denetim (imzasız), testflight (imzalı sınama sürümü) ya da magaza (imzalı mağaza sürümü)"
+        type: choice
+        options: [denetim, testflight, magaza]
+        default: denetim
+      kosucu:
+        # macos-26 koşucuları kapasite darlığında işi hiç almayabiliyor ("not acquired by Runner of type hosted").
+        # Yedek macos-15: imajında Xcode 26.x kurulu (actions/runner-images, macos-15-arm64, imaj 20261104: Xcode
+        # 26.3 / 26.2 / 26.1.1 / 26.0.1; varsayılanı 16.4). "Xcode sürümünü seç" adımı en yenisini seçer ve 26'dan
+        # eskiyse durur.
+        description: "koşucu imajı: macos-26 (varsayılan) ya da macos-15 (yedek; makine bulunamazsa)"
+        type: choice
+        options: [macos-26, macos-15]
+        default: macos-26
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GODOT_SURUMU: "4.7.2"
+  GODOT_DURUMU: "stable"
+  # Resmî sağlama dosyasından (godotengine/godot, 4.7.2-stable sürümü, SHA512-SUMS.txt). Sürüm değişince güncellenir.
+  GODOT_ZIP_SHA512: "38aa16e5bba2083941fc5b3e54be0089bd4cc35e32415f5b9fd9a8a6a7b9818255d44532ea8ef94b5aef56c4b407c2d634fa4f657e4ebe681ebbf59b7bac69ca"
+  SABLON_SHA512: "ca4d71c4d7b81dfc15d1a98baa07534aa95b03fdda78a0075b06672e1648d2e5f40980c9adc28d23e1b92e732ee7bf3461997aa804af74ec2fcd7a93ccb84079"
+
+jobs:
+  ios:
+    runs-on: ${{ inputs.kosucu || 'macos-26' }}
+    timeout-minutes: 60
+    # İmzalı hedefler "appstore" ortamında koşar (gizli değerler orada durur); denetim hiçbir gizli değer görmez.
+    environment: ${{ inputs.hedef == 'denetim' && 'derleme' || 'appstore' }}
+    env:
+      HEDEF: ${{ inputs.hedef }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Derleme tanımını oku
+        run: |
+          set -euo pipefail
+          if [ ! -f yansi.cfg ]; then
+            echo "::error::Bu dalda derlenecek içerik yok (yansi.cfg bulunamadı). İş akışı bir oyun/<kimlik> dalında başlatılır."
+            exit 1
+          fi
+          oku() { grep -m1 "^$1=" yansi.cfg | cut -d= -f2- | tr -d '\r'; }
+          OYUN="$(oku OYUN)"; PROJE="$(oku PROJE)"; KIP="$(oku KIP)"; CIKTI="$(oku CIKTI)"; REKLAM="$(oku REKLAM)"
+          [[ "$OYUN" =~ ^(pisti3d|online|batak|bilye|cansuyu|okey)$ ]] || { echo "::error::yansi.cfg: OYUN geçersiz"; exit 1; }
+          [[ "$PROJE" =~ ^godot(_[a-z0-9]+)?$ ]] || { echo "::error::yansi.cfg: PROJE geçersiz"; exit 1; }
+          [[ "$KIP" =~ ^(ham|disa_aktarilmis)$ ]] || { echo "::error::yansi.cfg: KIP geçersiz"; exit 1; }
+          [[ "$CIKTI" =~ ^(Pisti|Oyun)$ ]] || { echo "::error::yansi.cfg: CIKTI geçersiz"; exit 1; }
+          [[ "$REKLAM" =~ ^[01]$ ]] || { echo "::error::yansi.cfg: REKLAM geçersiz"; exit 1; }
+          [[ "$HEDEF" =~ ^(denetim|testflight|magaza)$ ]] || { echo "::error::hedef geçersiz"; exit 1; }
+          if [ "$HEDEF" = "magaza" ] && { [ "$OYUN" != "pisti3d" ] || [ "$KIP" != "ham" ]; }; then
+            echo "::error::magaza hedefi yalnız pisti3d oyununda ve ham proje kipinde desteklenir."
+            exit 1
+          fi
+          # Yapı numarası: UTC zaman damgası (YYAAGGSSDD). Koşu sayacı depoya göre sıfırdan başladığı için kullanılmaz;
+          # zaman damgası her zaman bir öncekinden büyüktür (App Store Connect aynı ya da küçük numarayı reddeder).
+          SURUM_NO="$(date -u +%y%m%d%H%M)"
+          {
+            echo "OYUN=$OYUN"; echo "PROJE=$PROJE"; echo "KIP=$KIP"; echo "CIKTI=$CIKTI"; echo "REKLAM=$REKLAM"
+            echo "SURUM_NO=$SURUM_NO"
+          } >> "$GITHUB_ENV"
+          # Günlük süzgeci: araç çıktıları günlüğe ham basılmaz; yalnız hata satırları, yol/kimlik/e-posta örtülerek.
+          cat > "$RUNNER_TEMP/suz.sh" <<'SUZ'
+          suz() {
+            grep -E 'error|ERROR|FAILED|SCRIPT ERROR|Parse Error|errSec|rejected|invalid|HATA|REKLAM KAPISI' "$1" | tail -n "${2:-40}" | sed -E \
+              -e "s#${GITHUB_WORKSPACE}#.#g" -e "s#${HOME}#~#g" \
+              -e 's#/(Users|private|var|Applications|Volumes)/[^ :"'"'"']*#<yol>#g' \
+              -e 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/<e-posta>/g' \
+              -e 's/(Apple|iPhone|iOS) (Distribution|Development|Developer)[^"]*/<imza kimliği>/g' \
+              -e 's/\(([A-Z0-9]{10})\)/(<takım>)/g' || true
+          }
+          SUZ
+          echo "Tanım: oyun=$OYUN kip=$KIP hedef=$HEDEF yapı=$SURUM_NO"
+
+      # Godot 4.7 iOS şablonu iOS 26 SDK'sı ister (Xcode 26+); en yeni kurulu Xcode seçilir.
+      - name: Xcode sürümünü seç
+        run: |
+          set -euo pipefail
+          YENI=$(ls -d /Applications/Xcode_*.app | grep -v -i beta | sort -V | tail -1)
+          sudo xcode-select -s "$YENI"
+          xcodebuild -version
+          ANA=$(xcodebuild -version | head -1 | sed -E 's/^Xcode ([0-9]+).*/\1/')
+          if [ "$ANA" -lt 26 ]; then
+            echo "::error::Bu koşucuda Xcode 26+ yok (en yenisi: $YENI). Godot 4.7 iOS şablonu iOS 26 SDK'sı ister."; exit 1
+          fi
+          xcrun --sdk iphoneos --show-sdk-version
+
+      # Önbellek kullanılmaz: her koşuda indirilir ve sağlama toplamı doğrulanır (önbellekten doğrulanmamış ikili gelmez).
+      - name: Godot'u ve iOS şablonunu indir, doğrula
+        run: |
+          set -euo pipefail
+          S="${GODOT_SURUMU}-${GODOT_DURUMU}"
+          TABAN="https://github.com/godotengine/godot/releases/download/${S}"
+          SABLONLAR="$HOME/Library/Application Support/Godot/export_templates/${GODOT_SURUMU}.${GODOT_DURUMU}"
+          mkdir -p "$HOME/godot" "$SABLONLAR"
+          cd "$RUNNER_TEMP"
+          if [ "$KIP" = "ham" ]; then
+            curl -fsSL --retry 3 -o godot.zip "${TABAN}/Godot_v${S}_macos.universal.zip"
+            echo "${GODOT_ZIP_SHA512}  godot.zip" | shasum -a 512 -c - >/dev/null || { echo "::error::Godot ikilisinin sağlama toplamı tutmuyor"; exit 1; }
+            unzip -q godot.zip -d "$HOME/godot"
+            rm -f godot.zip
+          fi
+          curl -fsSL --retry 3 -o sablon.tpz "${TABAN}/Godot_v${S}_export_templates.tpz"
+          echo "${SABLON_SHA512}  sablon.tpz" | shasum -a 512 -c - >/dev/null || { echo "::error::Dışa aktarma şablonunun sağlama toplamı tutmuyor"; exit 1; }
+          # yalnız iOS şablonu ve sürüm dosyası gerekir
+          unzip -q -j sablon.tpz "templates/ios.zip" "templates/version.txt" -d "$SABLONLAR"
+          rm -f sablon.tpz
+          echo "Sağlama toplamları doğrulandı (SHA-512)."
+
+      # Reklam eklentisi: SDK indirilir (eklentinin kendi sağlama denetimiyle), eklenti Godot başlıklarıyla derlenir.
+      # Önbelleğe yalnız bu deponun kendi koşuları yazar (tek tetikleyici workflow_dispatch).
+      - name: Reklam eklentisi (önbellek)
+        if: env.REKLAM == '1'
+        id: reklam_onbellek
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: godot/ios/plugins/reklam_levelplay
+          key: reklam-levelplay-ios-${{ env.GODOT_SURUMU }}-${{ hashFiles('eklentiler/levelplay/ios/**') }}
+
+      - name: Reklam eklentisini derle
+        if: env.REKLAM == '1' && steps.reklam_onbellek.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/suz.sh"
+          bash eklentiler/levelplay/ios/derle.sh godot "${GODOT_SURUMU}" >"$RUNNER_TEMP/eklenti.txt" 2>&1 \
+            || { echo "::error::reklam eklentisi derlenemedi"; suz "$RUNNER_TEMP/eklenti.txt" 60; exit 1; }
+          echo "Reklam eklentisi derlendi."
+
+      - name: Projeyi derlemeye hazırla (ham proje)
+        if: env.KIP == 'ham'
+        env:
+          TAKIM: ${{ vars.IOS_TEAM_ID }}
+          PAKET_PISTI3D: ${{ vars.IOS_BUNDLE_ID }}
+          PAKET_ONLINE: ${{ vars.IOS_ONLINE_BUNDLE_ID }}
+          PAKET_BATAK: ${{ vars.IOS_BATAK_BUNDLE_ID }}
+          PAKET_BILYE: ${{ vars.IOS_BILYE_BUNDLE_ID }}
+          PAKET_CANSUYU: ${{ vars.IOS_CANSUYU_BUNDLE_ID }}
+          PAKET_OKEY: ${{ vars.IOS_OKEY_BUNDLE_ID }}
+          SUNUCU_ONLINE: ${{ vars.PISTI_SUNUCU_ADRESI }}
+          SUNUCU_BATAK: ${{ vars.BATAK_SUNUCU_ADRESI }}
+          # Gizli reklam kimlikleri yalnız mağaza derlemesine verilir; öbür hedeflerde boş kalır.
+          REKLAM_IOS_UYGULAMA_ANAHTARI: ${{ inputs.hedef == 'magaza' && secrets.REKLAM_IOS_UYGULAMA_ANAHTARI || '' }}
+          REKLAM_IOS_ODULLU: ${{ inputs.hedef == 'magaza' && secrets.REKLAM_IOS_ODULLU || '' }}
+          REKLAM_IOS_GECIS: ${{ inputs.hedef == 'magaza' && secrets.REKLAM_IOS_GECIS || '' }}
+          REKLAM_IOS_AFIS: ${{ inputs.hedef == 'magaza' && secrets.REKLAM_IOS_AFIS || '' }}
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/suz.sh"
+          SUNUCU=""
+          case "$OYUN" in
+            pisti3d) PAKET="${PAKET_PISTI3D:-}" ;;
+            online)  PAKET="${PAKET_ONLINE:-}"; SUNUCU="${SUNUCU_ONLINE:-}" ;;
+            batak)   PAKET="${PAKET_BATAK:-}";  SUNUCU="${SUNUCU_BATAK:-}" ;;
+            bilye)   PAKET="${PAKET_BILYE:-}" ;;
+            cansuyu) PAKET="${PAKET_CANSUYU:-}" ;;
+            okey)    PAKET="${PAKET_OKEY:-}" ;;
+          esac
+          for D in "${TAKIM:-}" "$PAKET" "$SUNUCU"; do if [ -n "$D" ]; then echo "::add-mask::$D"; fi; done
+          if [ "$HEDEF" != "denetim" ] && [ -z "$PAKET" ]; then
+            echo "::error::Bu oyunun paket kimliği değişkeni boş (IOS_..._BUNDLE_ID)."
+            exit 1
+          fi
+          TAKIM="${TAKIM:-ABCDE12345}"; PAKET="${PAKET:-com.example.oyun}"
+          [[ "$TAKIM" =~ ^[A-Z0-9]{10}$ ]] || { echo "::error::IOS_TEAM_ID biçimi geçersiz"; exit 1; }
+          [[ "$PAKET" =~ ^[A-Za-z0-9.-]+$ ]] || { echo "::error::paket kimliği biçimi geçersiz"; exit 1; }
+          [[ "$SUNUCU" =~ ^[A-Za-z0-9.:/_-]*$ ]] || { echo "::error::sunucu adresi biçimi geçersiz"; exit 1; }
+          cd "$PROJE"
+          ONAYAR=$(grep -m1 '^name=' export_presets.cfg | cut -d'"' -f2)
+          echo "ONAYAR=$ONAYAR" >> "$GITHUB_ENV"
+          # editör eklentisinin çalışma zamanı yardımcısı ve geliştirme eklentileri telefona gitmez
+          sed -i '' '/_mcp_game_helper=/d' project.godot
+          sed -i '' '/^enabled=PackedStringArray("res:\/\/addons/d' project.godot
+          # oyun sunucusunun adresi (boşsa çevrim içi bölüm bağlanamaz)
+          sed -i '' "s|__SUNUCU_ADRESI__|${SUNUCU}|" project.godot
+          sed -i '' "s/__TEAM_ID__/${TAKIM}/; s/__BUNDLE_ID__/${PAKET}/; s/__BUILD_NO__/${SURUM_NO}/" export_presets.cfg
+          if [ "$OYUN" != "pisti3d" ]; then
+            # Telefon Sınaması düğmesi telefon derlemelerinde görünmez
+            sed -i '' 's/^custom_features="sinama"/custom_features=""/' export_presets.cfg
+          fi
+          if [ "$HEDEF" = "magaza" ]; then
+            # Mağaza sürümü: sınama düğmesi yok, kayıt dosyaları dışarıya açık değil.
+            sed -i '' 's/^custom_features="sinama"/custom_features=""/; s/^user_data\/accessible_from_files_app=true/user_data\/accessible_from_files_app=false/; s/^user_data\/accessible_from_itunes_sharing=true/user_data\/accessible_from_itunes_sharing=false/' export_presets.cfg
+            if [ "$REKLAM" = "1" ]; then
+              python3 ../araclar/reklam_kimlikleri_yaz.py reklam_kimlikleri.json >/dev/null
+              python3 ../araclar/reklam_kimlikleri_yaz.py --magaza-imi export_presets.cfg iOS >/dev/null
+            else
+              if grep -q "^const TEST_KIPI: bool = true" src/ui/reklam.gd; then
+                echo "::error::Deneme reklamı kipi açık: mağaza sürümüne giremez."
+                exit 1
+              fi
+              if ! grep -q '^const GIZLILIK_ADRESI: String = "https://' src/ui/ana_menu.gd; then
+                echo "::error::Gizlilik politikasının adresi boş ya da https değil."
+                exit 1
+              fi
+            fi
+            # KAPI: mağaza paketinde sınama özelliği ve dışarıya açık kayıt klasörü olamaz
+            if grep -qE '^custom_features=.*sinama' export_presets.cfg; then echo "::error::mağaza: sınama özelliği açık"; exit 1; fi
+            if grep -qE '^user_data/accessible_from_(files_app|itunes_sharing)=true' export_presets.cfg; then echo "::error::mağaza: kayıt klasörü dışarıya açık"; exit 1; fi
+          fi
+          if [ "$REKLAM" = "1" ]; then
+            # REKLAM GÜVENLİK KAPISI: mağaza dışı hedefte gerçek kimlik ya da mağaza imi varsa derleme durur.
+            # Kapının kendisi de sınanır: durması gereken yerde durmuyorsa derleme sürmez.
+            bash ../araclar/reklam_kapisi_sinamasi.sh >"$RUNNER_TEMP/kapi_sinama.txt" 2>&1 \
+              || { echo "::error::reklam kapısının sınaması başarısız"; suz "$RUNNER_TEMP/kapi_sinama.txt"; exit 1; }
+            bash ../araclar/reklam_kapisi_denetle.sh "$HEDEF" iOS >"$RUNNER_TEMP/kapi.txt" 2>&1 \
+              || { echo "::error::reklam kapısı derlemeyi durdurdu"; suz "$RUNNER_TEMP/kapi.txt"; exit 1; }
+            test -f ios/plugins/reklam_levelplay/reklam_levelplay.gdip
+            echo "Reklam kapısı geçildi."
+          fi
+          # Günlüğe yalnız kimlik içermeyen ayarlar yazılır.
+          grep -E "^custom_features|accessible_from|^plugins/" export_presets.cfg || true
+
+      - name: Dışa aktar (ham proje)
+        if: env.KIP == 'ham'
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/suz.sh"
+          GODOT="$HOME/godot/Godot.app/Contents/MacOS/Godot"
+          "$GODOT" --headless --path "$PROJE" --import >"$RUNNER_TEMP/ice_aktarma.txt" 2>&1 \
+            || { echo "::error::içe aktarma başarısız"; suz "$RUNNER_TEMP/ice_aktarma.txt"; exit 1; }
+          mkdir -p build/ios
+          "$GODOT" --headless --path "$PROJE" --export-release "$ONAYAR" "../build/ios/${CIKTI}.ipa" >"$RUNNER_TEMP/disa_aktarma.txt" 2>&1 \
+            || { echo "::error::dışa aktarma başarısız"; suz "$RUNNER_TEMP/disa_aktarma.txt"; exit 1; }
+          if [ ! -d "build/ios/${CIKTI}.xcodeproj" ]; then
+            echo "::error::Xcode projesi oluşmadı"; suz "$RUNNER_TEMP/disa_aktarma.txt"; exit 1
+          fi
+          echo "Xcode projesi hazır. Dışa aktarma hata satırı: $(grep -c -E 'ERROR' "$RUNNER_TEMP/disa_aktarma.txt" || true)"
+          suz "$RUNNER_TEMP/disa_aktarma.txt" 15
+
+      # Dışa aktarılmış kip: depoda Godot projesi değil, yerelde üretilmiş Xcode projesi (xcode/) vardır.
+      # Motor kitaplıkları depoda tutulmaz; doğrulanmış resmî şablondan yerine konur.
+      - name: Xcode projesini tamamla (dışa aktarılmış)
+        if: env.KIP == 'disa_aktarilmis'
+        env:
+          TAKIM: ${{ vars.IOS_TEAM_ID }}
+          PAKET_PISTI3D: ${{ vars.IOS_BUNDLE_ID }}
+          PAKET_ONLINE: ${{ vars.IOS_ONLINE_BUNDLE_ID }}
+          PAKET_BATAK: ${{ vars.IOS_BATAK_BUNDLE_ID }}
+          PAKET_BILYE: ${{ vars.IOS_BILYE_BUNDLE_ID }}
+          PAKET_CANSUYU: ${{ vars.IOS_CANSUYU_BUNDLE_ID }}
+          PAKET_OKEY: ${{ vars.IOS_OKEY_BUNDLE_ID }}
+        run: |
+          set -euo pipefail
+          case "$OYUN" in
+            pisti3d) PAKET="${PAKET_PISTI3D:-}" ;;
+            online)  PAKET="${PAKET_ONLINE:-}" ;;
+            batak)   PAKET="${PAKET_BATAK:-}" ;;
+            bilye)   PAKET="${PAKET_BILYE:-}" ;;
+            cansuyu) PAKET="${PAKET_CANSUYU:-}" ;;
+            okey)    PAKET="${PAKET_OKEY:-}" ;;
+          esac
+          for D in "${TAKIM:-}" "$PAKET"; do if [ -n "$D" ]; then echo "::add-mask::$D"; fi; done
+          if [ "$HEDEF" != "denetim" ] && [ -z "$PAKET" ]; then
+            echo "::error::Bu oyunun paket kimliği değişkeni boş (IOS_..._BUNDLE_ID)."
+            exit 1
+          fi
+          TAKIM="${TAKIM:-ABCDE12345}"; PAKET="${PAKET:-com.example.oyun}"
+          [[ "$TAKIM" =~ ^[A-Z0-9]{10}$ ]] || { echo "::error::IOS_TEAM_ID biçimi geçersiz"; exit 1; }
+          [[ "$PAKET" =~ ^[A-Za-z0-9.-]+$ ]] || { echo "::error::paket kimliği biçimi geçersiz"; exit 1; }
+          test -d "xcode/${CIKTI}.xcodeproj"
+          mkdir -p build && cp -R xcode build/ios
+          cd build/ios
+          SABLON="$HOME/Library/Application Support/Godot/export_templates/${GODOT_SURUMU}.${GODOT_DURUMU}/ios.zip"
+          unzip -q "$SABLON" 'libgodot.ios.release.xcframework/*' 'MoltenVK.xcframework/*' -d .
+          mv libgodot.ios.release.xcframework "${CIKTI}.xcframework"
+          # Yer tutucular (yerelde dışa aktarırken konan nötr değerler) gerçek değerlerle değiştirilir.
+          sed -i '' "s/YANSITAKIM/${TAKIM}/g; s/yansi\.yertutucu\.paket/${PAKET}/g; s/CURRENT_PROJECT_VERSION = 987654321;/CURRENT_PROJECT_VERSION = ${SURUM_NO};/g" \
+            "${CIKTI}.xcodeproj/project.pbxproj"
+          if grep -qE 'YANSITAKIM|yansi\.yertutucu\.paket|987654321' "${CIKTI}.xcodeproj/project.pbxproj"; then
+            echo "::error::Xcode projesinde doldurulmamış yer tutucu kaldı"; exit 1
+          fi
+          echo "Xcode projesi tamamlandı."
+
+      - name: İmzasız derle (denetim)
+        if: inputs.hedef == 'denetim'
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/suz.sh"
+          cd build/ios
+          xcodebuild -project "${CIKTI}.xcodeproj" -scheme "${CIKTI}" -configuration Release \
+            -destination "generic/platform=iOS" -derivedDataPath ../dd \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build >"$RUNNER_TEMP/xcodebuild.txt" 2>&1 \
+            || { echo "::error::xcodebuild başarısız"; suz "$RUNNER_TEMP/xcodebuild.txt" 60; exit 1; }
+          UYG=$(find ../dd/Build/Products -name "*.app" -maxdepth 2 | head -1)
+          test -d "$UYG"
+          PLIST="$UYG/Info.plist"
+          pb() { /usr/libexec/PlistBuddy -c "Print :$1" "$PLIST" 2>/dev/null || echo "yok"; }
+          GIZLI_DOSYA="yok"
+          if find "$UYG" -name "reklam_kimlikleri.json" | grep -q .; then GIZLI_DOSYA="VAR"; fi
+          {
+            echo "=== OZET BASI ==="
+            echo "oyun: $OYUN  kip: $KIP  hedef: denetim  sonuç: derlendi (imzasız)"
+            echo "uygulama boyutu: $(du -sh "$UYG" | cut -f1)  dosya sayısı: $(find "$UYG" -type f | wc -l | tr -d ' ')"
+            echo "veri paketi (pck): $(find "$UYG" -name '*.pck' -exec du -h {} \; | cut -f1 | head -1)"
+            echo "sürüm: $(pb CFBundleShortVersionString)  en düşük iOS: $(pb MinimumOSVersion)"
+            echo "izleme izni metni: $([ "$(pb NSUserTrackingUsageDescription)" = "yok" ] && echo yok || echo var)"
+            echo "SKAdNetwork kaydı: $(pb SKAdNetworkItems | grep -c SKAdNetworkIdentifier || true)"
+            echo "yerelleştirme klasörü (lproj): $(find "$UYG" -maxdepth 1 -name '*.lproj' | wc -l | tr -d ' ')"
+            echo "gömülü çerçeve: $(ls "$UYG/Frameworks" 2>/dev/null | wc -l | tr -d ' ')"
+            echo "gizli reklam kimlik dosyası: $GIZLI_DOSYA"
+            echo "=== OZET SONU ==="
+          } | tee "$RUNNER_TEMP/ozet.txt"
+          { echo '```'; cat "$RUNNER_TEMP/ozet.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$GIZLI_DOSYA" = "VAR" ]; then echo "::error::denetim derlemesinde gizli reklam kimlik dosyası var"; exit 1; fi
+
+      - name: İmzala ve TestFlight'a yükle
+        if: inputs.hedef == 'testflight' || inputs.hedef == 'magaza'
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          TAKIM: ${{ vars.IOS_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/suz.sh"
+          if [ -z "${ASC_KEY_ID}" ] || [ -z "${ASC_ISSUER_ID}" ] || [ -z "${ASC_KEY_P8}" ] || [ -z "${TAKIM}" ]; then
+            echo "::error::İmzalı hedef için ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8 gizli değerleri ve IOS_TEAM_ID değişkeni gerekli."
+            exit 1
+          fi
+          echo "::add-mask::$TAKIM"
+          umask 077
+          ANAHTAR="$RUNNER_TEMP/AuthKey_${ASC_KEY_ID}.p8"
+          trap 'rm -f "$ANAHTAR"' EXIT
+          printf '%s' "${ASC_KEY_P8}" > "$ANAHTAR"
+          cd build/ios
+          KIMLIK=(-allowProvisioningUpdates -authenticationKeyPath "$ANAHTAR" -authenticationKeyID "${ASC_KEY_ID}" -authenticationKeyIssuerID "${ASC_ISSUER_ID}")
+          # Arşiv imzasız alınır: geliştirme imzası hesapta kayıtlı cihaz ister. İmza dışa aktarırken atılır
+          # (mağaza dağıtım sertifikası ve profili API anahtarıyla Apple tarafında otomatik oluşturulur).
+          xcodebuild -project "${CIKTI}.xcodeproj" -scheme "${CIKTI}" -configuration Release \
+            -destination "generic/platform=iOS" -archivePath "../${CIKTI}.xcarchive" \
+            DEVELOPMENT_TEAM="${TAKIM}" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            archive >"$RUNNER_TEMP/arsiv.txt" 2>&1 \
+            || { echo "::error::arşivleme başarısız"; suz "$RUNNER_TEMP/arsiv.txt" 60; exit 1; }
+          printf '%s\n' \
+            '<?xml version="1.0" encoding="UTF-8"?>' \
+            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+            '<plist version="1.0"><dict>' \
+            '  <key>method</key><string>app-store-connect</string>' \
+            '  <key>destination</key><string>upload</string>' \
+            '  <key>signingStyle</key><string>automatic</string>' \
+            "  <key>teamID</key><string>${TAKIM}</string>" \
+            '  <key>uploadSymbols</key><true/>' \
+            '</dict></plist>' > "$RUNNER_TEMP/secenekler.plist"
+          # Çıktı klasörü çalışma alanının dışındadır; hiçbir şey artefakt olarak yüklenmez.
+          xcodebuild -exportArchive -archivePath "../${CIKTI}.xcarchive" -exportOptionsPlist "$RUNNER_TEMP/secenekler.plist" \
+            -exportPath "$RUNNER_TEMP/cikti" "${KIMLIK[@]}" >"$RUNNER_TEMP/yukleme.txt" 2>&1 \
+            || { echo "::error::imzalama ya da yükleme başarısız"; suz "$RUNNER_TEMP/yukleme.txt" 60; exit 1; }
+          {
+            echo "=== OZET BASI ==="
+            echo "oyun: $OYUN  kip: $KIP  hedef: $HEDEF  sonuç: TestFlight'a yüklendi"
+            echo "yapı numarası: ${SURUM_NO}  (işlenmesi birkaç dakika sürer)"
+            echo "=== OZET SONU ==="
+          } | tee "$RUNNER_TEMP/ozet.txt"
+          { echo '```'; cat "$RUNNER_TEMP/ozet.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
